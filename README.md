@@ -16,33 +16,25 @@ Example:
 - Skips common build folders and respects `.gitignore` (including nested `.gitignore`).
 - Only rewrites when the alias path is **shorter** than the relative path.
 
-## Setup
+## Install
+
+Install from npm to run it from anywhere:
 
 ```
-npm install
-```
-
-## Global Install (Optional)
-
-If you want to run it from anywhere:
-
-```
-npm install -g .
-shorten-imports /path/to/repo --dry-run
-shorten-imports /path/to/repo --write
+npm install -g shorten-imports
 ```
 
 ## Usage
 
 ```
-node scripts/shorten-imports.js <repoRoot> [--write] [--dry-run] [--verbose]
+shorten-imports <repoRoot> [--write] [--dry-run] [--verbose]
 ```
 
 Examples:
 
 ```
-node scripts/shorten-imports.js /path/to/repo --dry-run
-node scripts/shorten-imports.js /path/to/repo --write
+shorten-imports /path/to/repo --dry-run
+shorten-imports /path/to/repo --write
 ```
 
 ## Notes
