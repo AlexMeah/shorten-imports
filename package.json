@@ -1,6 +1,6 @@
 {
   "name": "shorten-imports",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "CLI to rewrite relative imports to the shortest tsconfig alias paths.",
   "license": "MIT",
   "repository": {
