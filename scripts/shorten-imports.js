@@ -40,6 +40,7 @@ function parseArgs(argv) {
     write: false,
     dryRun: false,
     verbose: false,
+    postProcessUpdatedPathReferences: false,
   };
 
   for (let i = 2; i < argv.length; i++) {
@@ -47,7 +48,9 @@ function parseArgs(argv) {
     if (arg === "--write") args.write = true;
     else if (arg === "--dry-run") args.dryRun = true;
     else if (arg === "--verbose") args.verbose = true;
-    else if (!args.root) args.root = arg;
+    else if (arg === "--update-refs") {
+      args.postProcessUpdatedPathReferences = true;
+    } else if (!args.root) args.root = arg;
     else {
       console.error(`Unknown arg: ${arg}`);
       process.exit(1);
@@ -56,7 +59,7 @@ function parseArgs(argv) {
 
   if (!args.root) {
     console.error(
-      "Usage: node scripts/shorten-imports.js <repoRoot> [--write] [--dry-run] [--verbose]",
+      "Usage: node scripts/shorten-imports.js <repoRoot> [--write] [--dry-run] [--verbose] [--update-refs]",
     );
     process.exit(1);
   }
@@ -161,6 +164,26 @@ function isWithinRoot(rootDir, targetAbs) {
   return !rel.startsWith("..") && !path.isAbsolute(rel);
 }
 
+function resolveExistingModulePath(targetAbs) {
+  if (fs.existsSync(targetAbs)) return targetAbs;
+
+  if (path.extname(targetAbs)) {
+    return null;
+  }
+
+  for (const ext of SUPPORTED_EXTS) {
+    const withExt = `${targetAbs}${ext}`;
+    if (fs.existsSync(withExt)) return withExt;
+  }
+
+  for (const ext of SUPPORTED_EXTS) {
+    const indexFile = path.join(targetAbs, `index${ext}`);
+    if (fs.existsSync(indexFile)) return indexFile;
+  }
+
+  return null;
+}
+
 function buildAliasForTarget(targetAbs, matchers, keepExt) {
   const candidates = [];
 
@@ -199,22 +222,27 @@ function resolveBareAlias(spec, matchers, baseUrl, rootDir, keepExt) {
       if (m.targetSuffix && innerTarget.endsWith(m.targetSuffix)) {
         innerTarget = innerTarget.slice(0, -m.targetSuffix.length);
       }
-      const targetAbs = path.resolve(
+      const unresolvedTargetAbs = path.resolve(
         m.targetPrefixAbs,
         innerTarget + m.targetSuffix,
       );
-      if (!isWithinRoot(rootDir, targetAbs)) continue;
-      if (!fs.existsSync(targetAbs)) continue;
+      const resolvedTargetAbs = resolveExistingModulePath(unresolvedTargetAbs);
+      if (!resolvedTargetAbs) continue;
+      if (!isWithinRoot(rootDir, resolvedTargetAbs)) continue;
 
       const aliasPath = `${m.aliasPrefix}${spec}${m.aliasSuffix}`;
       const finalAlias = keepExt ? aliasPath : stripExt(aliasPath);
       candidates.push(finalAlias);
     } else {
-      const targetAbs = path.resolve(m.targetPrefixAbs, m.targetSuffix);
-      if (!isWithinRoot(rootDir, targetAbs)) continue;
-      if (!fs.existsSync(targetAbs)) continue;
+      const unresolvedTargetAbs = path.resolve(
+        m.targetPrefixAbs,
+        m.targetSuffix,
+      );
+      const resolvedTargetAbs = resolveExistingModulePath(unresolvedTargetAbs);
+      if (!resolvedTargetAbs) continue;
+      if (!isWithinRoot(rootDir, resolvedTargetAbs)) continue;
 
-      const targetRel = toPosix(path.relative(baseUrl, targetAbs));
+      const targetRel = toPosix(path.relative(baseUrl, unresolvedTargetAbs));
       if (targetRel !== spec) continue;
 
       const aliasPath = `${m.aliasPrefix}${m.aliasSuffix}`;
@@ -285,10 +313,13 @@ function updateImportsInFile(filePath, tsconfigCache, rootDir) {
 
   let changed = false;
   const edits = new Map();
+  const updatedPathPairs = [];
 
   const fileDir = path.dirname(filePath);
   const tsconfigPath = findNearestTsconfig(fileDir, rootDir);
-  if (!tsconfigPath) return { changed: false, text: sourceText };
+  if (!tsconfigPath) {
+    return { changed: false, text: sourceText, updatedPathPairs };
+  }
 
   let aliasInfo = tsconfigCache.get(tsconfigPath);
   if (!aliasInfo) {
@@ -300,45 +331,115 @@ function updateImportsInFile(filePath, tsconfigCache, rootDir) {
     tsconfigCache.set(tsconfigPath, aliasInfo);
   }
 
-  if (!aliasInfo) return { changed: false, text: sourceText };
+  if (!aliasInfo) {
+    return { changed: false, text: sourceText, updatedPathPairs };
+  }
 
   const { matchers, baseUrl } = aliasInfo;
   const rootAbs = path.resolve(rootDir);
 
+  function queueModuleSpecifierRewrite(moduleExpr) {
+    if (!moduleExpr || !ts.isStringLiteral(moduleExpr)) return;
+
+    const spec = moduleExpr.text;
+    if (isRelative(spec)) {
+      const keepExt = hasImportExt(spec);
+      const targetAbs = path.resolve(fileDir, spec);
+      const bestAlias = buildAliasForTarget(targetAbs, matchers, keepExt);
+      if (bestAlias && bestAlias.length < spec.length) {
+        edits.set(moduleExpr.getStart(sourceFile) + 1, {
+          start: moduleExpr.getStart(sourceFile) + 1,
+          end: moduleExpr.getEnd() - 1,
+          text: bestAlias,
+        });
+        updatedPathPairs.push([spec, bestAlias]);
+        changed = true;
+      }
+    } else {
+      const keepExt = hasImportExt(spec);
+      const bestAlias = resolveBareAlias(
+        spec,
+        matchers,
+        baseUrl,
+        rootAbs,
+        keepExt,
+      );
+      if (bestAlias && bestAlias !== spec) {
+        edits.set(moduleExpr.getStart(sourceFile) + 1, {
+          start: moduleExpr.getStart(sourceFile) + 1,
+          end: moduleExpr.getEnd() - 1,
+          text: bestAlias,
+        });
+        updatedPathPairs.push([spec, bestAlias]);
+        changed = true;
+      }
+    }
+  }
+
   function visit(node) {
     if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
-      const moduleExpr = node.moduleSpecifier;
-      if (moduleExpr && ts.isStringLiteral(moduleExpr)) {
-        const spec = moduleExpr.text;
-        if (isRelative(spec)) {
-          const keepExt = hasImportExt(spec);
-          const targetAbs = path.resolve(fileDir, spec);
-          const bestAlias = buildAliasForTarget(targetAbs, matchers, keepExt);
-          if (bestAlias && bestAlias.length < spec.length) {
-            edits.set(moduleExpr.getStart(sourceFile) + 1, {
-              start: moduleExpr.getStart(sourceFile) + 1,
-              end: moduleExpr.getEnd() - 1,
-              text: bestAlias,
-            });
-            changed = true;
-          }
-        } else {
-          const keepExt = hasImportExt(spec);
-          const bestAlias = resolveBareAlias(
-            spec,
-            matchers,
-            baseUrl,
-            rootAbs,
-            keepExt,
-          );
-          if (bestAlias && bestAlias !== spec) {
-            edits.set(moduleExpr.getStart(sourceFile) + 1, {
-              start: moduleExpr.getStart(sourceFile) + 1,
-              end: moduleExpr.getEnd() - 1,
-              text: bestAlias,
-            });
-            changed = true;
-          }
+      queueModuleSpecifierRewrite(node.moduleSpecifier);
+    } else if (
+      ts.isCallExpression(node) &&
+      node.expression.kind === ts.SyntaxKind.ImportKeyword
+    ) {
+      const arg = node.arguments[0];
+      queueModuleSpecifierRewrite(arg);
+    }
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+
+  if (!changed) return { changed: false, text: sourceText, updatedPathPairs };
+
+  const sortedEdits = Array.from(edits.values()).sort(
+    (a, b) => b.start - a.start,
+  );
+  let output = sourceText;
+  for (const e of sortedEdits) {
+    output = output.slice(0, e.start) + e.text + output.slice(e.end);
+  }
+
+  return { changed: true, text: output, updatedPathPairs };
+}
+
+function isImportExportModuleSpecifier(node) {
+  const parent = node.parent;
+  if (!parent) return false;
+  if (ts.isImportDeclaration(parent) || ts.isExportDeclaration(parent)) {
+    return parent.moduleSpecifier === node;
+  }
+  return false;
+}
+
+function updatePathReferencesInFile(filePath, replacementMap) {
+  if (replacementMap.size === 0) {
+    return { changed: false, text: fs.readFileSync(filePath, "utf8") };
+  }
+
+  const sourceText = fs.readFileSync(filePath, "utf8");
+  const sourceFile = ts.createSourceFile(
+    filePath,
+    sourceText,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+
+  let changed = false;
+  const edits = new Map();
+
+  function visit(node) {
+    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+      if (!isImportExportModuleSpecifier(node)) {
+        const nextValue = replacementMap.get(node.text);
+        if (nextValue && nextValue !== node.text) {
+          edits.set(node.getStart(sourceFile) + 1, {
+            start: node.getStart(sourceFile) + 1,
+            end: node.getEnd() - 1,
+            text: nextValue,
+          });
+          changed = true;
         }
       }
     }
@@ -360,6 +461,21 @@ function updateImportsInFile(filePath, tsconfigCache, rootDir) {
   return { changed: true, text: output };
 }
 
+function buildStableReplacementMap(updatedPathMap) {
+  const stableMap = new Map();
+  const conflicts = [];
+
+  for (const [fromPath, toPathSet] of updatedPathMap.entries()) {
+    if (toPathSet.size === 1) {
+      stableMap.set(fromPath, toPathSet.values().next().value);
+    } else {
+      conflicts.push(fromPath);
+    }
+  }
+
+  return { stableMap, conflicts };
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   const rootDir = path.resolve(args.root);
@@ -371,19 +487,38 @@ async function main() {
     process.exit(1);
   }
 
+  const postProcessUpdatedPathReferences =
+    args.postProcessUpdatedPathReferences;
+
   const tsconfigCache = new Map();
   let filesScanned = 0;
   let filesChanged = 0;
+  let postProcessedFilesChanged = 0;
   const progressEvery = 200;
+  const allSourceFiles = [];
+  const updatedPathMap = new Map();
 
   for await (const file of walk(rootDir, [])) {
     filesScanned++;
+    allSourceFiles.push(file);
     if (args.verbose) {
       console.log(`[scan] ${file}`);
     } else if (filesScanned % progressEvery === 0) {
       console.log(`[progress] scanned ${filesScanned} files...`);
     }
-    const { changed, text } = updateImportsInFile(file, tsconfigCache, rootDir);
+    const { changed, text, updatedPathPairs } = updateImportsInFile(
+      file,
+      tsconfigCache,
+      rootDir,
+    );
+    for (const [fromPath, toPath] of updatedPathPairs) {
+      let set = updatedPathMap.get(fromPath);
+      if (!set) {
+        set = new Set();
+        updatedPathMap.set(fromPath, set);
+      }
+      set.add(toPath);
+    }
     if (changed) {
       filesChanged++;
       if (args.write) {
@@ -394,11 +529,46 @@ async function main() {
     }
   }
 
+  if (postProcessUpdatedPathReferences && updatedPathMap.size > 0) {
+    const { stableMap, conflicts } = buildStableReplacementMap(updatedPathMap);
+    if (conflicts.length > 0) {
+      console.warn(
+        `Skipped ${conflicts.length} ambiguous path reference mapping(s) during post processing.`,
+      );
+      if (args.verbose) {
+        for (const fromPath of conflicts) {
+          const candidates = Array.from(updatedPathMap.get(fromPath)).sort();
+          console.warn(`  ${fromPath} -> ${candidates.join(", ")}`);
+        }
+      }
+    }
+
+    for (const file of allSourceFiles) {
+      const { changed, text } = updatePathReferencesInFile(file, stableMap);
+      if (!changed) continue;
+
+      postProcessedFilesChanged++;
+      if (args.write) {
+        fs.writeFileSync(file, text, "utf8");
+      } else if (args.verbose || args.dryRun || !args.write) {
+        console.log(`[post-change] ${file}`);
+      }
+    }
+  }
+
   console.log(`Scanned ${filesScanned} files.`);
   if (args.write) {
     console.log(`Updated ${filesChanged} files.`);
+    if (postProcessUpdatedPathReferences) {
+      console.log(`Post-processed ${postProcessedFilesChanged} files.`);
+    }
   } else {
     console.log(`Would update ${filesChanged} files. Use --write to apply.`);
+    if (postProcessUpdatedPathReferences) {
+      console.log(
+        `Would post-process ${postProcessedFilesChanged} files. Use --write to apply.`,
+      );
+    }
   }
 }
 

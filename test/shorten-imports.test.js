@@ -206,3 +206,142 @@ test("does rewrite bare module specifiers", () => {
   const updated = readFile(targetFile);
   assert.match(updated, /from \"@\/components\/Thing\.tsx\"/);
 });
+
+test("does not post-process exact path references by default", () => {
+  const root = mkdtemp();
+
+  writeJson(path.join(root, "tsconfig.json"), {
+    compilerOptions: {
+      baseUrl: ".",
+      paths: {
+        "@/*": ["src/*"],
+      },
+    },
+  });
+
+  writeFile(
+    path.join(root, "src", "components", "CompanyAdminRoute.tsx"),
+    "export const CompanyAdminRoute = () => null;\n",
+  );
+
+  const importerFile = path.join(root, "src", "pages", "Page.tsx");
+  writeFile(
+    importerFile,
+    [
+      'import { CompanyAdminRoute } from "components/CompanyAdminRoute";',
+      "export default function Page() { return <CompanyAdminRoute />; }",
+      "",
+    ].join("\n"),
+  );
+
+  const jestFile = path.join(root, "src", "pages", "Page.test.tsx");
+  writeFile(
+    jestFile,
+    [
+      'jest.mock("components/CompanyAdminRoute", () => ({',
+      "  CompanyAdminRoute: () => null,",
+      "}));",
+      "",
+    ].join("\n"),
+  );
+
+  runCli(root, ["--write"]);
+
+  const importerUpdated = readFile(importerFile);
+  assert.match(importerUpdated, /from \"@\/components\/CompanyAdminRoute\"/);
+
+  const jestUpdated = readFile(jestFile);
+  assert.match(jestUpdated, /jest\.mock\(\"components\/CompanyAdminRoute\"/);
+});
+
+test("post-processes exact path references when enabled via CLI arg", () => {
+  const root = mkdtemp();
+
+  writeJson(path.join(root, "tsconfig.json"), {
+    compilerOptions: {
+      baseUrl: ".",
+      paths: {
+        "@/*": ["src/*"],
+      },
+    },
+  });
+
+  writeFile(
+    path.join(root, "src", "components", "CompanyAdminRoute.tsx"),
+    "export const CompanyAdminRoute = () => null;\n",
+  );
+
+  writeFile(
+    path.join(root, "src", "pages", "Page.tsx"),
+    [
+      'import { CompanyAdminRoute } from "components/CompanyAdminRoute";',
+      "export default function Page() { return <CompanyAdminRoute />; }",
+      "",
+    ].join("\n"),
+  );
+
+  const jestFile = path.join(root, "src", "pages", "Page.test.tsx");
+  writeFile(
+    jestFile,
+    [
+      'jest.mock("components/CompanyAdminRoute", () => ({',
+      "  CompanyAdminRoute: () => null,",
+      "}));",
+      "",
+    ].join("\n"),
+  );
+
+  runCli(root, ["--write", "--update-refs"]);
+
+  const jestUpdated = readFile(jestFile);
+  assert.match(jestUpdated, /jest\.mock\(\"@\/components\/CompanyAdminRoute\"/);
+});
+
+test("rewrites dynamic import() paths and post-processes matching jest.mock references", () => {
+  const root = mkdtemp();
+
+  writeJson(path.join(root, "tsconfig.json"), {
+    compilerOptions: {
+      baseUrl: ".",
+      paths: {
+        "@/*": ["src/*"],
+      },
+    },
+  });
+
+  writeFile(
+    path.join(root, "src", "components", "CompanyAdminRoute.tsx"),
+    "export default function CompanyAdminRoute() { return null; }\n",
+  );
+
+  const appFile = path.join(root, "src", "App.tsx");
+  writeFile(
+    appFile,
+    [
+      "const CompanyAdminRoute = lazy(",
+      '  () => import("components/CompanyAdminRoute"),',
+      ");",
+      "",
+    ].join("\n"),
+  );
+
+  const specFile = path.join(root, "src", "App.spec.tsx");
+  writeFile(
+    specFile,
+    [
+      'jest.mock("components/CompanyAdminRoute", () => ({',
+      "  __esModule: true,",
+      "  default: () => null,",
+      "}));",
+      "",
+    ].join("\n"),
+  );
+
+  runCli(root, ["--write", "--update-refs"]);
+
+  const appUpdated = readFile(appFile);
+  assert.match(appUpdated, /import\(\"@\/components\/CompanyAdminRoute\"\)/);
+
+  const specUpdated = readFile(specFile);
+  assert.match(specUpdated, /jest\.mock\(\"@\/components\/CompanyAdminRoute\"/);
+});
