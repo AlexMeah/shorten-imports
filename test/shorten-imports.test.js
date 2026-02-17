@@ -174,3 +174,35 @@ test("defaults baseUrl to repo root when missing", () => {
   const updated = readFile(targetFile);
   assert.match(updated, /from \"@\/components\/Thing\.tsx\"/);
 });
+
+test("does rewrite bare module specifiers", () => {
+  const root = mkdtemp();
+
+  writeJson(path.join(root, "tsconfig.json"), {
+    compilerOptions: {
+      baseUrl: ".",
+      paths: {
+        "@/*": ["src/*"],
+      },
+    },
+  });
+
+  writeFile(
+    path.join(root, "src", "components", "Thing.tsx"),
+    "export const Thing = () => null;\n",
+  );
+
+  const targetFile = path.join(root, "src", "pages", "Page.tsx");
+  const original = [
+    'import { Thing } from "components/Thing.tsx";',
+    'import React from "react";',
+    "export default function Page() { return <Thing />; }",
+    "",
+  ].join("\n");
+  writeFile(targetFile, original);
+
+  runCli(root, ["--write"]);
+
+  const updated = readFile(targetFile);
+  assert.match(updated, /from \"@\/components\/Thing\.tsx\"/);
+});

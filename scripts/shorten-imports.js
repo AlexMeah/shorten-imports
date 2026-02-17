@@ -155,6 +155,12 @@ function parseStarPattern(pattern) {
   return { prefix, suffix, hasStar: true };
 }
 
+function isWithinRoot(rootDir, targetAbs) {
+  const rel = path.relative(rootDir, targetAbs);
+  if (!rel) return true;
+  return !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
 function buildAliasForTarget(targetAbs, matchers, keepExt) {
   const candidates = [];
 
@@ -180,6 +186,44 @@ function buildAliasForTarget(targetAbs, matchers, keepExt) {
 
   if (candidates.length === 0) return null;
 
+  candidates.sort((a, b) => a.length - b.length || a.localeCompare(b));
+  return candidates[0];
+}
+
+function resolveBareAlias(spec, matchers, baseUrl, rootDir, keepExt) {
+  const candidates = [];
+
+  for (const m of matchers) {
+    if (m.hasStar) {
+      let innerTarget = spec;
+      if (m.targetSuffix && innerTarget.endsWith(m.targetSuffix)) {
+        innerTarget = innerTarget.slice(0, -m.targetSuffix.length);
+      }
+      const targetAbs = path.resolve(
+        m.targetPrefixAbs,
+        innerTarget + m.targetSuffix,
+      );
+      if (!isWithinRoot(rootDir, targetAbs)) continue;
+      if (!fs.existsSync(targetAbs)) continue;
+
+      const aliasPath = `${m.aliasPrefix}${spec}${m.aliasSuffix}`;
+      const finalAlias = keepExt ? aliasPath : stripExt(aliasPath);
+      candidates.push(finalAlias);
+    } else {
+      const targetAbs = path.resolve(m.targetPrefixAbs, m.targetSuffix);
+      if (!isWithinRoot(rootDir, targetAbs)) continue;
+      if (!fs.existsSync(targetAbs)) continue;
+
+      const targetRel = toPosix(path.relative(baseUrl, targetAbs));
+      if (targetRel !== spec) continue;
+
+      const aliasPath = `${m.aliasPrefix}${m.aliasSuffix}`;
+      const finalAlias = keepExt ? aliasPath : stripExt(aliasPath);
+      candidates.push(finalAlias);
+    }
+  }
+
+  if (candidates.length === 0) return null;
   candidates.sort((a, b) => a.length - b.length || a.localeCompare(b));
   return candidates[0];
 }
@@ -258,7 +302,8 @@ function updateImportsInFile(filePath, tsconfigCache, rootDir) {
 
   if (!aliasInfo) return { changed: false, text: sourceText };
 
-  const { matchers } = aliasInfo;
+  const { matchers, baseUrl } = aliasInfo;
+  const rootAbs = path.resolve(rootDir);
 
   function visit(node) {
     if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
@@ -270,6 +315,23 @@ function updateImportsInFile(filePath, tsconfigCache, rootDir) {
           const targetAbs = path.resolve(fileDir, spec);
           const bestAlias = buildAliasForTarget(targetAbs, matchers, keepExt);
           if (bestAlias && bestAlias.length < spec.length) {
+            edits.set(moduleExpr.getStart(sourceFile) + 1, {
+              start: moduleExpr.getStart(sourceFile) + 1,
+              end: moduleExpr.getEnd() - 1,
+              text: bestAlias,
+            });
+            changed = true;
+          }
+        } else {
+          const keepExt = hasImportExt(spec);
+          const bestAlias = resolveBareAlias(
+            spec,
+            matchers,
+            baseUrl,
+            rootAbs,
+            keepExt,
+          );
+          if (bestAlias && bestAlias !== spec) {
             edits.set(moduleExpr.getStart(sourceFile) + 1, {
               start: moduleExpr.getStart(sourceFile) + 1,
               end: moduleExpr.getEnd() - 1,
