@@ -8,6 +8,26 @@ Example:
 ../../../components/Hello.tsx  ->  @/components/Hello.tsx
 ```
 
+More import update examples:
+
+```
+import { Card } from "../../ui/Card";
+// -> import { Card } from "@/ui/Card";
+
+export { CompanyAdminRoute } from "../components/CompanyAdminRoute.tsx";
+// -> export { CompanyAdminRoute } from "@/components/CompanyAdminRoute.tsx";
+
+const AdminPage = lazy(() => import("components/CompanyAdminRoute"));
+// -> const AdminPage = lazy(() => import("@/components/CompanyAdminRoute"));
+```
+
+When you run with `--update-refs`, exact string references are updated too:
+
+```
+jest.mock("components/CompanyAdminRoute");
+// -> jest.mock("@/components/CompanyAdminRoute");
+```
+
 ## Features
 
 - Resolves **full absolute paths** to preserve nested hierarchies.
@@ -47,6 +67,7 @@ shorten-imports /path/to/repo --write --update-refs
 - If multiple aliases match, the CLI chooses the **shortest** alias path.
 - If the original import includes an extension, the alias keeps it.
 - Post-processing only applies unambiguous mappings (`oldPath` mapped to exactly one `newPath`).
+- Bare imports are not rewritten when a matching `node_modules` package exists; the CLI logs a warning.
 
 ## Limitations
 

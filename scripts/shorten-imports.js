@@ -184,6 +184,41 @@ function resolveExistingModulePath(targetAbs) {
   return null;
 }
 
+function getPackageNameFromSpecifier(spec) {
+  if (!spec) return null;
+  const parts = spec.split("/");
+  if (spec.startsWith("@")) {
+    if (parts.length < 2) return null;
+    return `${parts[0]}/${parts[1]}`;
+  }
+  return parts[0] || null;
+}
+
+function hasNodeModulesPackage(packageName, startDir, rootDir, cache) {
+  const cacheKey = `${startDir}::${packageName}`;
+  if (cache.has(cacheKey)) return cache.get(cacheKey);
+
+  let current = startDir;
+  const root = path.resolve(rootDir);
+  const packageSegments = packageName.split("/");
+  let found = false;
+
+  while (true) {
+    const candidate = path.join(current, "node_modules", ...packageSegments);
+    if (fs.existsSync(candidate)) {
+      found = true;
+      break;
+    }
+    if (current === root) break;
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+
+  cache.set(cacheKey, found);
+  return found;
+}
+
 function buildAliasForTarget(targetAbs, matchers, keepExt) {
   const candidates = [];
 
@@ -302,7 +337,12 @@ async function* walk(dir, ignoreStack) {
   }
 }
 
-function updateImportsInFile(filePath, tsconfigCache, rootDir) {
+function updateImportsInFile(
+  filePath,
+  tsconfigCache,
+  nodeModuleConflictCache,
+  rootDir,
+) {
   const sourceText = fs.readFileSync(filePath, "utf8");
   const sourceFile = ts.createSourceFile(
     filePath,
@@ -337,6 +377,7 @@ function updateImportsInFile(filePath, tsconfigCache, rootDir) {
 
   const { matchers, baseUrl } = aliasInfo;
   const rootAbs = path.resolve(rootDir);
+  const warnedNodeModuleConflicts = new Set();
 
   function queueModuleSpecifierRewrite(moduleExpr) {
     if (!moduleExpr || !ts.isStringLiteral(moduleExpr)) return;
@@ -365,6 +406,26 @@ function updateImportsInFile(filePath, tsconfigCache, rootDir) {
         keepExt,
       );
       if (bestAlias && bestAlias !== spec) {
+        const packageName = getPackageNameFromSpecifier(spec);
+        if (
+          packageName &&
+          hasNodeModulesPackage(
+            packageName,
+            fileDir,
+            rootAbs,
+            nodeModuleConflictCache,
+          )
+        ) {
+          const warningKey = `${filePath}::${spec}`;
+          if (!warnedNodeModuleConflicts.has(warningKey)) {
+            console.warn(
+              `[warn] Skipping bare import "${spec}" in ${filePath} because node_modules package "${packageName}" exists.`,
+            );
+            warnedNodeModuleConflicts.add(warningKey);
+          }
+          return;
+        }
+
         edits.set(moduleExpr.getStart(sourceFile) + 1, {
           start: moduleExpr.getStart(sourceFile) + 1,
           end: moduleExpr.getEnd() - 1,
@@ -491,6 +552,7 @@ async function main() {
     args.postProcessUpdatedPathReferences;
 
   const tsconfigCache = new Map();
+  const nodeModuleConflictCache = new Map();
   let filesScanned = 0;
   let filesChanged = 0;
   let postProcessedFilesChanged = 0;
@@ -509,6 +571,7 @@ async function main() {
     const { changed, text, updatedPathPairs } = updateImportsInFile(
       file,
       tsconfigCache,
+      nodeModuleConflictCache,
       rootDir,
     );
     for (const [fromPath, toPath] of updatedPathPairs) {

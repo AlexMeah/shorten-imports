@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
-const { execFileSync } = require("node:child_process");
+const { execFileSync, spawnSync } = require("node:child_process");
 
 const CLI_PATH = path.resolve(__dirname, "..", "scripts", "shorten-imports.js");
 
@@ -31,6 +31,21 @@ function runCli(rootDir, args) {
   execFileSync(process.execPath, [CLI_PATH, rootDir, ...args], {
     stdio: "pipe",
   });
+}
+
+function runCliWithOutput(rootDir, args) {
+  const result = spawnSync(process.execPath, [CLI_PATH, rootDir, ...args], {
+    encoding: "utf8",
+  });
+  if (result.status !== 0) {
+    throw new Error(
+      `Command failed (exit ${result.status}):\n${result.stderr || result.stdout}`,
+    );
+  }
+  return {
+    stdout: result.stdout || "",
+    stderr: result.stderr || "",
+  };
 }
 
 test("rewrites to the shortest alias using tsconfig paths", () => {
@@ -205,6 +220,52 @@ test("does rewrite bare module specifiers", () => {
 
   const updated = readFile(targetFile);
   assert.match(updated, /from \"@\/components\/Thing\.tsx\"/);
+});
+
+test("does not rewrite bare imports when matching node_modules package exists and logs warning", () => {
+  const root = mkdtemp();
+
+  writeJson(path.join(root, "tsconfig.json"), {
+    compilerOptions: {
+      baseUrl: ".",
+      paths: {
+        "@/*": ["src/*"],
+      },
+    },
+  });
+
+  writeFile(
+    path.join(root, "src", "components", "Thing.tsx"),
+    "export const Thing = () => null;\n",
+  );
+
+  writeJson(path.join(root, "node_modules", "components", "package.json"), {
+    name: "components",
+    version: "1.0.0",
+  });
+  writeFile(
+    path.join(root, "node_modules", "components", "index.js"),
+    "module.exports = {};\n",
+  );
+
+  const targetFile = path.join(root, "src", "pages", "Page.tsx");
+  writeFile(
+    targetFile,
+    [
+      'import { Thing } from "components/Thing.tsx";',
+      "export default function Page() { return <Thing />; }",
+      "",
+    ].join("\n"),
+  );
+
+  const { stderr } = runCliWithOutput(root, ["--write"]);
+  const updated = readFile(targetFile);
+
+  assert.match(updated, /from \"components\/Thing\.tsx\"/);
+  assert.match(
+    stderr,
+    /\[warn\] Skipping bare import \"components\/Thing\.tsx\"/,
+  );
 });
 
 test("does not post-process exact path references by default", () => {
